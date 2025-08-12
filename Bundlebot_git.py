@@ -1,4 +1,4 @@
-# app.py
+# app.py (parent-product bundle picker)
 import os, time, json, textwrap
 from typing import List, Optional, Dict
 import requests
@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 import google.generativeai as genai
 
+# --- Streamlit Cloud secrets -> env ---
 try:
     import streamlit as st  # already imported
     for k in ("SHOPIFY_STORE","SHOPIFY_TOKEN","GEMINI_API_KEY","API_VERSION","ADMIN_PASSWORD"):
@@ -14,7 +15,8 @@ try:
             os.environ[k] = str(st.secrets[k])
 except Exception:
     pass
-    
+
+# --- Simple password gate ---
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 if "auth_ok" not in st.session_state:
     st.session_state.auth_ok = False
@@ -29,7 +31,6 @@ if not st.session_state.auth_ok:
         else:
             st.error("Nope.")
     st.stop()
-
 
 # =========================
 # Config & setup
@@ -46,14 +47,14 @@ HEADERS = {"Content-Type": "application/json", "X-Shopify-Access-Token": TOKEN}
 genai.configure(api_key=GEMINI_API_KEY)
 MODEL_NAME = "gemini-2.5-flash"
 
-st.set_page_config(page_title="Shopify Bundle Builder (Fixed)", page_icon="🧩", layout="wide")
-st.title("🧩 Summer Fridays Bundle Builder")
+st.set_page_config(page_title="Shopify Bundle Builder (Parent Products)", page_icon="🧩", layout="wide")
+st.title("🧩 Summer Fridays Bundle Builder — Parent Products (buyer picks variant)")
 
 # =========================
-# Models (no JSON-Schema constraints)
+# Models (use product_id, not variant_id)
 # =========================
 class ComponentDraft(BaseModel):
-    variant_id: str
+    product_id: str
     quantity: int = 1  # clamp >=1 later
 
 class BundleDraft(BaseModel):
@@ -68,7 +69,7 @@ class BundleDraft(BaseModel):
 # =========================
 def gemini_propose_bundle_draft(context: Dict) -> BundleDraft:
     """
-    Ask Gemini to return raw JSON (no response_schema). Validate with Pydantic.
+    Ask Gemini for bundle title/desc/price and components using ONLY product_ids provided.
     """
     sys = textwrap.dedent("""
         You are a Shopify merchandising assistant.
@@ -78,12 +79,12 @@ def gemini_propose_bundle_draft(context: Dict) -> BundleDraft:
           "description_html": string,       // brief marketing copy (valid HTML; can include <ul><li>)
           "price": number,                  // non-negative; .00 or .99 if reasonable
           "compare_at_price": number|null,  // optional; >= price if discounting; else null
-          "components": [                   // use provided variant_ids; don't invent
-            {"variant_id": string, "quantity": number}
+          "components": [                   // use provided product_ids; don't invent
+            {"product_id": string, "quantity": number}
           ]
         }
         Rules:
-        - Use the exact variant_ids from context; default quantity = 1 unless user asked otherwise.
+        - Use ONLY product_ids from context; default quantity = 1 unless user asked otherwise.
         - Do not invent products/SKUs/IDs.
     """).strip()
 
@@ -93,7 +94,7 @@ def gemini_propose_bundle_draft(context: Dict) -> BundleDraft:
     )
 
     prompt = (
-        "Selected variants and notes:\n"
+        "Selected products and notes:\n"
         + json.dumps(context, indent=2)
         + "\nReturn ONLY the JSON object."
     )
@@ -102,24 +103,22 @@ def gemini_propose_bundle_draft(context: Dict) -> BundleDraft:
     data = json.loads(resp.text)
     return BundleDraft(**data)
 
-def gemini_suggest_companions(anchor: Dict, candidates: List[Dict], k: int = 2) -> List[str]:
+def gemini_suggest_companions_products(anchor: Dict, candidates: List[Dict], k: int = 2) -> List[str]:
     """
-    Ask Gemini to choose k companion variant_ids from provided candidates (by id),
-    based on complementarity, vendor/productType/tags/title, and price sanity.
-    Returns a list of variant_id strings (subset of the provided candidates).
+    Ask Gemini to choose k companion product_ids from provided candidates based on complementarity.
+    Returns a list of product_id strings (subset of the provided candidates).
     """
     sys = """
     You are a Shopify merchandising assistant. Choose complementary products
     to form a sensible fixed bundle around the anchor product.
 
     Return ONLY a JSON object like:
-    {"variant_ids": ["gid://shopify/ProductVariant/123", "gid://shopify/ProductVariant/456"]}
+    {"product_ids": ["gid://shopify/Product/123", "gid://shopify/Product/456"]}
 
     Rules:
-    - Use ONLY variant_ids that appear in candidates.
-    - Pick distinct variant_ids; exclude the anchor's variant_id.
-    - Prefer complements (e.g., cleanser + toner + moisturizer); same vendor when sensible.
-    - Use productType/tags/title to infer fit.
+    - Use ONLY product_ids that appear in candidates.
+    - Pick distinct product_ids; exclude the anchor's product_id.
+    - Prefer complements (e.g., tint + blush + lip balm) and consider vendor/productType/tags/title.
     - Keep price mix reasonable for a bundle.
     """
     model = genai.GenerativeModel(
@@ -128,38 +127,33 @@ def gemini_suggest_companions(anchor: Dict, candidates: List[Dict], k: int = 2) 
     )
 
     anchor_compact = {
-        "variant_id": anchor["variant"]["id"],
-        "variant_title": anchor["variant"]["title"],
-        "product_title": anchor["product"]["title"],
-        "vendor": anchor["product"].get("vendor"),
-        "productType": anchor["product"].get("productType"),
-        "tags": anchor["product"].get("tags"),
-        "price": anchor["variant"].get("price"),
+        "product_id": anchor["id"],
+        "product_title": anchor["title"],
+        "vendor": anchor.get("vendor"),
+        "productType": anchor.get("productType"),
+        "tags": anchor.get("tags"),
+        "options": anchor.get("options"),
     }
 
-    # Keep candidates compact + bounded
-    cand_compact = []
-    for c in candidates[:200]:
-        cand_compact.append({
-            "variant_id": c["variant"]["id"],
-            "variant_title": c["variant"]["title"],
-            "product_title": c["product"]["title"],
-            "vendor": c["product"].get("vendor"),
-            "productType": c["product"].get("productType"),
-            "tags": c["product"].get("tags"),
-            "price": c["variant"].get("price"),
-        })
+    cand_compact = [{
+        "product_id": c["id"],
+        "product_title": c["title"],
+        "vendor": c.get("vendor"),
+        "productType": c.get("productType"),
+        "tags": c.get("tags"),
+        "options": c.get("options"),
+    } for c in candidates[:200]]
 
     prompt = (
         f"anchor:\n{json.dumps(anchor_compact, indent=2)}\n\n"
         f"candidates:\n{json.dumps(cand_compact, indent=2)}\n\n"
-        f"Pick exactly {k} companion variant_ids from the candidates (exclude the anchor)."
+        f"Pick exactly {k} companion product_ids from the candidates (exclude the anchor)."
     )
     resp = model.generate_content([sys, prompt])
     try:
         data = json.loads(resp.text)
-        variant_ids = data.get("variant_ids") or []
-        return [str(v) for v in variant_ids][:k]
+        pids = data.get("product_ids") or []
+        return [str(v) for v in pids][:k]
     except Exception:
         return []
 
@@ -182,9 +176,11 @@ def shopify_graphql(query: str, variables: dict = None, max_retries: int = 6):
         return data["data"]
     raise RuntimeError("Shopify GraphQL: exceeded retry budget (throttled?)")
 
-def _fetch_products_page(after: Optional[str] = None, first: int = 250):
-    # fetch richer product fields to help AI suggestion
-    query = """
+def fetch_all_products_only() -> list:
+    """
+    Fetch products (no variant paging needed). We need id/title/vendor/type/tags/options.
+    """
+    q = """
     query($first:Int!, $after:String){
       products(first:$first, after:$after, sortKey:TITLE) {
         edges {
@@ -196,87 +192,46 @@ def _fetch_products_page(after: Optional[str] = None, first: int = 250):
             productType
             tags
             options { id name values }
-            variants(first:250) {
-              edges {
-                node {
-                  id
-                  title
-                  price
-                  selectedOptions { name value }
-                }
-              }
-              pageInfo { hasNextPage endCursor }
-            }
           }
         }
         pageInfo { hasNextPage endCursor }
       }
     }
     """
-    return shopify_graphql(query, {"first": first, "after": after})["products"]
-
-def _fetch_more_variants(product_id: str, after: Optional[str]):
-    query = """
-    query($id:ID!, $after:String){
-      node(id:$id){
-        ... on Product {
-          id
-          variants(first:250, after:$after){
-            edges {
-              node {
-                id
-                title
-                price
-                selectedOptions { name value }
-              }
-            }
-            pageInfo { hasNextPage endCursor }
-          }
-        }
-      }
-    }
-    """
-    return shopify_graphql(query, {"id": product_id, "after": after})["node"]["variants"]
-
-def fetch_all_products_variants() -> List[dict]:
-    """Return product nodes with ALL variants paged in."""
-    products: List[dict] = []
-    after_products = None
+    out, after = [], None
     while True:
-        page = _fetch_products_page(after_products, first=250)
-        for edge in page["edges"]:
-            p = edge["node"]
-            v_page = p["variants"]
-            while v_page["pageInfo"]["hasNextPage"]:
-                v_page = _fetch_more_variants(p["id"], v_page["pageInfo"]["endCursor"])
-                p["variants"]["edges"].extend(v_page["edges"])
-            products.append(p)
-        if not page["pageInfo"]["hasNextPage"]:
+        data = shopify_graphql(q, {"first": 250, "after": after})["products"]
+        for e in data["edges"]:
+            out.append(e["node"])
+        if not data["pageInfo"]["hasNextPage"]:
             break
-        after_products = page["pageInfo"]["endCursor"]
-        time.sleep(0.3)  # be polite to the API
-    return products
+        after = data["pageInfo"]["endCursor"]
+        time.sleep(0.25)
+    return out
 
-def build_component_inputs(selected_variant_ids: List[str], product_index: Dict[str, dict]):
-    """Build ProductBundleComponentInput[] mapping variant selectedOptions -> product.options."""
+def build_component_inputs_from_products(selected_product_ids: list, prod_index: dict):
+    """
+    Build ProductBundleComponentInput[] from parent products.
+    For each component, include optionSelections with ALL option values so the buyer can choose
+    the variant on the bundle product page.
+    """
     components = []
-    for vgid in selected_variant_ids:
-        prod = product_index[vgid]["product"]
-        variant = product_index[vgid]["variant"]
-        option_id_by_name = {opt["name"]: opt["id"] for opt in prod["options"]}
+    for pid in selected_product_ids:
+        p = prod_index[pid]
         optionSelections = []
-        for so in variant["selectedOptions"]:
-            name, value = so["name"], so["value"]
-            if name in option_id_by_name:
-                optionSelections.append({
-                    "componentOptionId": option_id_by_name[name],
-                    "name": name,
-                    "values": [value],
-                })
+        for opt in p.get("options", []) or []:
+            values = [v for v in (opt.get("values") or []) if v]
+            if not values:
+                continue
+            optionSelections.append({
+                "componentOptionId": opt["id"],        # option id of the component product
+                "name": opt["name"] or "Option",       # label shown on parent bundle
+                "values": values                        # ALL allowed values so shopper can pick
+            })
         components.append({
-            "productId": prod["id"],
+            "productId": pid,
             "quantity": 1,
-            "optionSelections": optionSelections,
+            "optionSelections": optionSelections,       # [] if product has no options
         })
     return components
 
@@ -353,7 +308,7 @@ def get_default_variant_id(product_id: str) -> str:
 
 def set_price_on_variant(product_id: str, variant_id: str, price: float, compare_at_price: Optional[float]):
     """
-    productVariantsBulkUpdate requires productId.
+    Set price (and optional compareAtPrice) on the bundle's default variant.
     """
     mutation = """
     mutation($productId: ID!, $variants:[ProductVariantsBulkInput!]!) {
@@ -392,58 +347,38 @@ def _rerun():
         st.experimental_rerun()
 
 # =========================
-# Load catalog once
+# Load catalog once (PRODUCTS, not variants)
 # =========================
 if "catalog" not in st.session_state:
-    with st.spinner("Loading products & variants (first load may take a minute)…"):
-        products = fetch_all_products_variants()
-        # Build variant index & display labels
-        var_index = {}
-        choices = []
-        for p in products:
-            for ve in p["variants"]["edges"]:
-                v = ve["node"]
-                label = f'{p["title"]} — {v["title"]}  ({v["id"].split("/")[-1]})'
-                choices.append((label, v["id"]))
-                var_index[v["id"]] = {"product": p, "variant": v}
-        st.session_state.catalog = {"products": products, "var_index": var_index, "choices": choices}
+    with st.spinner("Loading products (first load may take a minute)…"):
+        products = fetch_all_products_only()
+        prod_index = {p["id"]: p for p in products}
+        choices = [(f'{p["title"]} ({p["id"].split("/")[-1]})', p["id"]) for p in products]
+        st.session_state.catalog = {"products": products, "prod_index": prod_index, "choices": choices}
 
 catalog = st.session_state.catalog
-labels = [label for label, _ in catalog["choices"]]
-id_by_label = {label: vid for label, vid in catalog["choices"]}
+product_labels = [label for label, _ in catalog["choices"]]
+product_id_by_label = {label: pid for label, pid in catalog["choices"]}
 
 # Session state
-if "picked_variant_ids" not in st.session_state:
-    st.session_state.picked_variant_ids = []
+if "picked_product_ids" not in st.session_state:
+    st.session_state.picked_product_ids = []
 if "search_nonce" not in st.session_state:
     st.session_state.search_nonce = 0
-if "last_suggested_vids" not in st.session_state:
-    st.session_state.last_suggested_vids = []
+if "last_suggested_pids" not in st.session_state:
+    st.session_state.last_suggested_pids = []
 
-# -------------------------
-# Candidate pool for AI suggestions
-# -------------------------
-def _candidate_pool_for_anchor(anchor_vid: str, var_index: Dict[str, Dict]) -> List[Dict]:
-    """Create a candidate list: same vendor first, then same productType, then everything else."""
-    anchor = var_index[anchor_vid]
-    avendor = (anchor["product"].get("vendor") or "").lower()
-    atype = (anchor["product"].get("productType") or "").lower()
-
-    same_vendor, same_type, others = [], [], []
-    for vid, entry in var_index.items():
-        if vid == anchor_vid:
-            continue
-        vendor = (entry["product"].get("vendor") or "").lower()
-        ptype = (entry["product"].get("productType") or "").lower()
-        if avendor and vendor == avendor:
-            same_vendor.append(entry)
-        elif atype and ptype == atype:
-            same_type.append(entry)
-        else:
-            others.append(entry)
-
-    out = same_vendor + same_type + others
-    return out[:400]
+# For Gemini context convenience
+def _product_brief(pid: str):
+    p = catalog["prod_index"][pid]
+    return {
+        "product_id": p["id"],
+        "title": p["title"],
+        "vendor": p.get("vendor"),
+        "productType": p.get("productType"),
+        "tags": p.get("tags"),
+        "options": p.get("options"),
+    }
 
 # =========================
 # UI
@@ -451,33 +386,47 @@ def _candidate_pool_for_anchor(anchor_vid: str, var_index: Dict[str, Dict]) -> L
 left, right = st.columns([2, 1])
 
 with left:
-    # --- AI Suggest Companions ---
-    st.markdown("### 🔮 AI: suggest 2 companions")
-    st.caption("Pick one anchor product/variant and let AI suggest two complementary variants to add.")
+    # --- AI Suggest Companions (products) ---
+    st.markdown("### 🔮 AI: suggest 2 companion products")
+    st.caption("Pick one anchor product and let AI suggest two complementary products to add.")
 
-    anchor_label = st.selectbox("Pick anchor variant", options=["—"] + labels, index=0)
+    anchor_label = st.selectbox("Pick anchor product", options=["—"] + product_labels, index=0)
     col_suggest, col_add_suggested = st.columns([1,1])
 
     with col_suggest:
         disabled = (anchor_label == "—")
         if st.button("✨ Suggest 2 companions", use_container_width=True, disabled=disabled):
-            anchor_vid = id_by_label[anchor_label]
-            anchor_entry = catalog["var_index"][anchor_vid]
-            candidates = _candidate_pool_for_anchor(anchor_vid, catalog["var_index"])
+            anchor_pid = product_id_by_label[anchor_label]
+            anchor_product = catalog["prod_index"][anchor_pid]
+
+            # candidate pool: same vendor → same productType → others
+            same_vendor, same_type, others = [], [], []
+            avendor = (anchor_product.get("vendor") or "").lower()
+            atype = (anchor_product.get("productType") or "").lower()
+            for p in catalog["products"]:
+                pid = p["id"]
+                if pid == anchor_pid: 
+                    continue
+                vendor = (p.get("vendor") or "").lower()
+                ptype = (p.get("productType") or "").lower()
+                if avendor and vendor == avendor:
+                    same_vendor.append(p)
+                elif atype and ptype == atype:
+                    same_type.append(p)
+                else:
+                    others.append(p)
+            candidates = (same_vendor + same_type + others)[:400]
+
             try:
-                vids = gemini_suggest_companions(anchor_entry, candidates, k=2)
-                # Validate selections
+                pids = gemini_suggest_companions_products(anchor_product, candidates, k=2)
+                # Validate & keep only product_ids we actually have
                 valid = []
-                for v in vids:
-                    if v in catalog["var_index"] and v != anchor_vid and v not in valid:
-                        valid.append(v)
-                st.session_state.last_suggested_vids = valid
+                for pid in pids:
+                    if pid in catalog["prod_index"] and pid != anchor_pid and pid not in valid:
+                        valid.append(pid)
+                st.session_state.last_suggested_pids = valid
                 if valid:
-                    lbls = []
-                    for v in valid:
-                        p = catalog["var_index"][v]["product"]["title"]
-                        t = catalog["var_index"][v]["variant"]["title"]
-                        lbls.append(f"{p} — {t} ({v.split('/')[-1]})")
+                    lbls = [f'{catalog["prod_index"][pid]["title"]} ({pid.split("/")[-1]})' for pid in valid]
                     st.success("Suggested:\n- " + "\n- ".join(lbls))
                 else:
                     st.warning("No valid suggestions returned. Try a different anchor.")
@@ -485,69 +434,68 @@ with left:
                 st.error(f"Suggestion failed: {e}")
 
     with col_add_suggested:
-        suggested = st.session_state.last_suggested_vids
+        suggested = st.session_state.last_suggested_pids
         if st.button("➕ Add suggested to bundle", use_container_width=True, disabled=(len(suggested)==0)):
-            for v in suggested:
-                if v not in st.session_state.picked_variant_ids:
-                    st.session_state.picked_variant_ids.append(v)
-            st.success("Added suggested items to your bundle.")
+            for pid in suggested:
+                if pid not in st.session_state.picked_product_ids:
+                    st.session_state.picked_product_ids.append(pid)
+            st.success("Added suggested products to your bundle.")
 
     st.markdown("---")
 
-    # --- Search-as-you-type picker (nonce key) ---
-    st.markdown("### Search products & variants")
+    # --- Search-as-you-type picker (PRODUCTS) ---
+    st.markdown("### Search products")
     q = st.text_input(
-        "Type to search by product, variant, or ID",
-        help="Filters locally. Try part of a product title, variant option, or the numeric variant ID."
+        "Type to search by product title or ID",
+        help="Filters locally. Try part of the product title or the numeric product ID."
     )
 
     def _label_matches(label: str, term: str) -> bool:
         t = (term or "").strip().lower()
         return True if not t else t in label.lower()
 
-    filtered_labels = [l for l in labels if _label_matches(l, q)]
+    filtered_labels = [l for l in product_labels if _label_matches(l, q)]
 
-    multi_key = f"search_results_multiselect_{st.session_state.search_nonce}"
-    search_select = st.multiselect(
+    multi_key = f"prod_multiselect_{st.session_state.search_nonce}"
+    picked_labels = st.multiselect(
         "Search results",
         options=filtered_labels,
         key=multi_key,
-        help="Pick one or more from results, then click 'Add to bundle'."
+        help="Pick one or more products, then click 'Add to bundle'."
     )
 
     col_add, col_clear = st.columns([1,1])
     with col_add:
-        if st.button("➕ Add to bundle", use_container_width=True, disabled=len(search_select) == 0):
-            for lab in search_select:
-                vid = id_by_label[lab]
-                if vid not in st.session_state.picked_variant_ids:
-                    st.session_state.picked_variant_ids.append(vid)
+        if st.button("➕ Add products to bundle", use_container_width=True, disabled=len(picked_labels) == 0):
+            for lab in picked_labels:
+                pid = product_id_by_label[lab]
+                if pid not in st.session_state.picked_product_ids:
+                    st.session_state.picked_product_ids.append(pid)
             st.session_state.search_nonce += 1
             _rerun()
 
     with col_clear:
-        if st.button("🗑️ Clear all selected", use_container_width=True, disabled=len(st.session_state.picked_variant_ids) == 0):
-            st.session_state.picked_variant_ids = []
+        if st.button("🗑️ Clear all selected", use_container_width=True, disabled=len(st.session_state.picked_product_ids) == 0):
+            st.session_state.picked_product_ids = []
 
-    st.markdown("#### Your bundle components")
-    if not st.session_state.picked_variant_ids:
-        st.info("No components yet. Use AI suggestions or search above and add variants.")
+    st.markdown("#### Your bundle components (products)")
+    if not st.session_state.picked_product_ids:
+        st.info("No components yet. Use AI suggestions or search above and add products.")
     else:
         remove_ids = []
-        for vid in st.session_state.picked_variant_ids:
-            p = catalog["var_index"][vid]["product"]
-            v = catalog["var_index"][vid]["variant"]
-            label = f'{p["title"]} — {v["title"]}  ({vid.split("/")[-1]})'
+        for pid in st.session_state.picked_product_ids:
+            p = catalog["prod_index"][pid]
+            label = f'{p["title"]} ({pid.split("/")[-1]})'
             c1, c2 = st.columns([6,1])
             c1.write(label)
-            if c2.button("Remove", key=f"rm_{vid}"):
-                remove_ids.append(vid)
-        for vid in remove_ids:
-            st.session_state.picked_variant_ids.remove(vid)
+            if c2.button("Remove", key=f"rm_{pid}"):
+                remove_ids.append(pid)
+        for pid in remove_ids:
+            st.session_state.picked_product_ids.remove(pid)
 
-    picked_variant_ids = st.session_state.picked_variant_ids
+    picked_product_ids = st.session_state.picked_product_ids
 
-    # --- Gemini chat → draft ---
+    # --- Gemini chat → draft (PRODUCTS) ---
     st.markdown("### Chat with AI about the bundle")
     st.caption("Ask for title, description, and pricing. The AI returns a structured draft you can tweak.")
 
@@ -557,26 +505,16 @@ with left:
             "description_html": "",
             "price": 0.0,
             "compare_at_price": None,
-            "components": [{"variant_id": vid, "quantity": 1} for vid in picked_variant_ids],
+            "components": [{"product_id": pid, "quantity": 1} for pid in picked_product_ids],
         }
 
-    user_msg = st.text_input("Your prompt (e.g., “Make a summer skincare duo at 15% off.”)")
+    user_msg = st.text_input("Your prompt (e.g., “Tint + Blush + Lip Balm summer set at 15% off.”)")
     colA, colB = st.columns([1,1])
 
     with colA:
-        if st.button("💡 Propose details with Gemini", use_container_width=True, disabled=not picked_variant_ids):
+        if st.button("💡 Propose details with Gemini", use_container_width=True, disabled=not picked_product_ids):
             context = {
-                "selected_variants": [
-                    {
-                        "variant_id": vid,
-                        "title": catalog["var_index"][vid]["variant"]["title"],
-                        "product_title": catalog["var_index"][vid]["product"]["title"],
-                        "vendor": catalog["var_index"][vid]["product"].get("vendor"),
-                        "productType": catalog["var_index"][vid]["product"].get("productType"),
-                        "tags": catalog["var_index"][vid]["product"].get("tags"),
-                        "price": catalog["var_index"][vid]["variant"].get("price"),
-                    } for vid in picked_variant_ids
-                ],
+                "selected_products": [_product_brief(pid) for pid in picked_product_ids],
                 "notes": user_msg or "",
             }
             try:
@@ -590,9 +528,14 @@ with left:
                 for c in draft.get("components", []):
                     c["quantity"] = max(1, int(c.get("quantity") or 1))
 
-                # Ensure components exist
+                # Ensure components exist and belong to picked set
                 if not draft.get("components"):
-                    draft["components"] = [{"variant_id": vid, "quantity": 1} for vid in picked_variant_ids]
+                    draft["components"] = [{"product_id": pid, "quantity": 1} for pid in picked_product_ids]
+                else:
+                    # keep only components that are in picked_product_ids
+                    draft["components"] = [
+                        c for c in draft["components"] if c.get("product_id") in picked_product_ids
+                    ] or [{"product_id": pid, "quantity": 1} for pid in picked_product_ids]
 
                 st.session_state.draft = draft
                 st.success("Draft received from AI.")
@@ -606,7 +549,7 @@ with left:
                 "description_html": "",
                 "price": 0.0,
                 "compare_at_price": None,
-                "components": [{"variant_id": vid, "quantity": 1} for vid in picked_variant_ids],
+                "components": [{"product_id": pid, "quantity": 1} for pid in picked_product_ids],
             }
 
     # Editable draft
@@ -617,23 +560,23 @@ with left:
     d["compare_at_price"] = st.number_input("Compare-at price (optional)", value=float(d.get("compare_at_price") or 0.0), step=0.5, min_value=0.0)
 
     # Keep components aligned with current picks unless user customized quantities already
-    existing_ids = {c.get("variant_id") for c in d.get("components", []) if c.get("variant_id")}
-    for vid in picked_variant_ids:
-        if vid not in existing_ids:
-            d.setdefault("components", []).append({"variant_id": vid, "quantity": 1})
-    d["components"] = [c for c in d.get("components", []) if c.get("variant_id") in picked_variant_ids]
+    existing_ids = {c.get("product_id") for c in d.get("components", []) if c.get("product_id")}
+    for pid in picked_product_ids:
+        if pid not in existing_ids:
+            d.setdefault("components", []).append({"product_id": pid, "quantity": 1})
+    d["components"] = [c for c in d.get("components", []) if c.get("product_id") in picked_product_ids]
     st.session_state.draft = d
 
 with right:
     st.subheader("Create bundle")
-    st.caption("Creates a componentized product, sets description & price, activates it, and publishes.")
-    if st.button("🚀 Create bundle on Shopify", type="primary", use_container_width=True, disabled=len(st.session_state.picked_variant_ids) == 0):
+    st.caption("Creates a componentized product from PARENT products (buyer chooses variant), sets description & price, and publishes.")
+    if st.button("🚀 Create bundle on Shopify", type="primary", use_container_width=True, disabled=len(st.session_state.picked_product_ids) == 0):
         try:
             draft: Dict = st.session_state["draft"]
 
-            comp_inputs = build_component_inputs(
-                [c["variant_id"] for c in draft.get("components", []) if c.get("variant_id")],
-                catalog["var_index"]
+            comp_inputs = build_component_inputs_from_products(
+                [c["product_id"] for c in draft.get("components", []) if c.get("product_id")],
+                catalog["prod_index"]
             )
 
             # 1) Create bundle (returns operation id)
@@ -655,9 +598,8 @@ with right:
             # 5) Publish to current channel
             publish_to_current_channel(product_id)
 
-            st.success("Bundle created & published!")
+            st.success("Bundle created from parent products & published! Shoppers can now choose variants on the bundle page.")
             admin_link = f"https://{SHOP}/admin/products/{product_id.split('/')[-1]}"
             st.markdown(f"[Open in Shopify Admin]({admin_link})")
         except Exception as e:
             st.error(f"Failed to create bundle: {e}")
-
