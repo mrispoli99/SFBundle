@@ -21,7 +21,7 @@ if "auth_ok" not in st.session_state:
 
 if not st.session_state.auth_ok:
     st.title("🔒 Summer Fridays Bundle Builder Login")
-    pwd = st.text_input("SFBundle2025", type="password")
+    pwd = st.text_input("Enter Password", type="password")
     if st.button("Enter"):
         if pwd and ADMIN_PASSWORD and pwd == ADMIN_PASSWORD:
             st.session_state.auth_ok = True
@@ -660,3 +660,4 @@ with right:
             st.markdown(f"[Open in Shopify Admin]({admin_link})")
         except Exception as e:
             st.error(f"Failed to create bundle: {e}")
+
